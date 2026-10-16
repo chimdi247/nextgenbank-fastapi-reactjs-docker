@@ -1,0 +1,7 @@
+window.__APP_CONFIG__ = {
+  tools: {
+    mailpit: "${MAILPIT_URL}", grafana: "${GRAFANA_URL}", prometheus: "${PROMETHEUS_URL}",
+    rabbitmq: "${RABBITMQ_URL}", flower: "${FLOWER_URL}", mlflow: "${MLFLOW_URL}",
+    redisUi: "${REDIS_UI_URL}", apiDocs: "${API_DOCS_URL}",
+  },
+};

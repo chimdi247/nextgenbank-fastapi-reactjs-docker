@@ -1,0 +1,691 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  NextGen Bank - complete local stack in ONE compose file
+#
+#    docker compose -f local.yml up -d --build
+#
+#  Web app      http://localhost:8088        admin@example.com / password123
+#  API docs     http://localhost:8000/api/v1/docs
+#  Mailpit      http://localhost:8025        login OTP codes + activation e-mails + alert e-mails land here
+#  Grafana      http://localhost:3000        admin / admin    (dashboards, logs, traces, alerts)
+#  Prometheus   http://localhost:9090
+#  RabbitMQ     http://localhost:15672       guest / guest
+#  Flower       http://localhost:5555        admin / admin
+#  MLflow       http://localhost:4000
+#  Redis UI     http://localhost:8081
+#
+#  Optional (profile "tests"):
+#    docker compose -f local.yml --profile tests run --rm unit-tests
+#    docker compose -f local.yml --profile tests run --rm integration-tests
+#    docker compose -f local.yml --profile tests up -d selenium && \
+#    docker compose -f local.yml --profile tests run --rm e2e-tests
+#    docker compose -f local.yml --profile tests run --rm k6 run /scripts/smoke.js
+# ════════════════════════════════════════════════════════════════════════════
+name: nextgenbank
+
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  TZ: UTC
+
+x-api: &api
+  build:
+    context: .
+    dockerfile: ./backend/docker/local/fastapi/Dockerfile
+  image: nextgenbank-api:local
+  env_file:
+    - ./.envs/.env.local
+  restart: unless-stopped
+  networks:
+    - nextgen_local_nw
+
+services:
+  # ═══════════════════════════ WEB APP ═══════════════════════════
+  # React + shadcn/ui, served by nginx, which also proxies /api to the FastAPI service (same origin: no CORS,
+  # cookies just work) and sends activation / reset-password e-mail links to the matching UI pages.
+  frontend:
+    build:
+      context: ./frontend
+    image: nextgenbank-frontend:local
+    container_name: nextgen-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8088}:80"
+    environment:
+      MAILPIT_URL: http://34.171.152.81:8025
+      GRAFANA_URL: http://34.171.152.81:3000
+      PROMETHEUS_URL: http://34.171.152.81:9090
+      RABBITMQ_URL: http://34.171.152.81:15672
+      FLOWER_URL: http://34.171.152.81:5555
+      MLFLOW_URL: http://34.171.152.81:4000
+      REDIS_UI_URL: http://34.171.152.81:8081
+      API_DOCS_URL: http://34.171.152.81/api/v1/docs
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128m
+    networks:
+      - nextgen_local_nw
+
+  # ═══════════════════════════ BACKEND ═══════════════════════════
+  api:
+    <<: *api
+    container_name: nextgen-api
+    command: /start.sh
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: nextgen-api
+      RUN_MIGRATIONS: "true"
+    volumes:
+      - nextgen_api_logs:/src/backend/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+      mlflow:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=4)\""]
+      interval: 10s
+      timeout: 6s
+      retries: 20
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
+
+  celeryworker:
+    <<: *api
+    container_name: nextgen-celeryworker
+    command: /start-celeryworker.sh
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: nextgen-worker
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
+
+  celerybeat:
+    <<: *api
+    container_name: nextgen-celerybeat
+    command: /start-celerybeat.sh
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: nextgen-beat
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1g
+
+  flower:
+    <<: *api
+    container_name: nextgen-flower
+    command: /start-flower.sh
+    ports:
+      - "5555:5555"
+    environment:
+      OTEL_SDK_DISABLED: "true"
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1g
+
+  # ═══════════════════════════ DATA STORES ═══════════════════════════
+  postgres:
+    image: postgres:16-bookworm
+    container_name: nextgen-postgres
+    restart: unless-stopped
+    env_file:
+      - ./.envs/.env.local
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+      - -c
+      - max_connections=100
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=1s
+      - -c
+      - "log_line_prefix=%m [%p] %u@%d "
+    ports:
+      - "5432:5432"
+    volumes:
+      - nextgen_local_db:/var/lib/postgresql/data
+      # Executed once, in file-name order, when the data volume is created:
+      #   00 extensions + roles | 01 all tables | 02 admin@example.com | 03 demo data | 04 Grafana read-only grants
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    networks:
+      - nextgen_local_nw
+
+  # Connection pooling for the API and the Celery workers (transaction pooling, 20 server connections)
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: nextgen-pgbouncer
+    restart: unless-stopped
+    entrypoint: ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./docker/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - nextgen_local_nw
+
+  redis:
+    image: docker.io/redis:7.2-alpine
+    container_name: nextgen-redis
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - nextgen_redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+    networks:
+      - nextgen_local_nw
+
+  # Redis browser. Connection settings: observability/redis-ui/redis-commander.json
+  redis-ui:
+    image: rediscommander/redis-commander:latest
+    container_name: nextgen-redis-ui
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./observability/redis-ui/redis-commander.json:/redis-commander/config/local.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 192m
+    networks:
+      - nextgen_local_nw
+
+  rabbitmq:
+    image: docker.io/rabbitmq:3.13-management
+    container_name: nextgen-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+    volumes:
+      - nextgen_rabbitmq_data:/var/lib/rabbitmq
+      # management UI + the built-in Prometheus endpoint (:15692)
+      - ./observability/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+    networks:
+      - nextgen_local_nw
+
+  mailpit:
+    image: docker.io/axllent/mailpit:v1.20.3
+    container_name: nextgen-mailpit
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+    volumes:
+      - nextgen_mailpit_data:/data
+    environment:
+      MP_MAX_MESSAGES: 5000
+      MP_DATA_FILE: /data/mailpit.db
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - nextgen_local_nw
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.20.3
+    container_name: nextgen-mlflow
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - nextgen_mlflow_data:/mlflow
+    env_file:
+      - ./.envs/.env.local
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 4000
+      --backend-store-uri ${MLFLOW_BACKEND_STORE_URI:-sqlite:////mlflow/mlflow.db}
+      --artifacts-destination ${MLFLOW_ARTIFACTS_DESTINATION:-/mlflow/artifacts}
+      --serve-artifacts
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+    networks:
+      - nextgen_local_nw
+
+  # ═══════════════════════════ OBSERVABILITY ═══════════════════════════
+  # api / worker / beat --OTLP--> otel-collector --> Tempo (traces) | Prometheus (metrics) | Loki (logs) --> Grafana
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: nextgen-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./observability/otel-collector/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - tempo
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+    networks:
+      - nextgen_local_nw
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: nextgen-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-remote-write-receiver   # Tempo span-metrics and k6 write here
+      - --enable-feature=exemplar-storage    # metric -> trace links
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - nextgen_prometheus_data:/prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+    networks:
+      - nextgen_local_nw
+
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: nextgen-loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - nextgen_loki_data:/loki
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - nextgen_local_nw
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: nextgen-tempo
+    restart: unless-stopped
+    user: "0:0"
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - nextgen_tempo_data:/var/tempo
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - nextgen_local_nw
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nextgen-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      # read by observability/grafana/grafana.ini ([smtp]) and by the alert contact point
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-chimdi247@gmail.com}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-support@noreply.com}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-shimdi247@gmail.com}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./observability/grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - nextgen_grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+      - mailpit
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+    networks:
+      - nextgen_local_nw
+
+  # Container logs of the infrastructure (postgres, pgbouncer, rabbitmq, redis, nginx...) -> Loki.
+  # The API's own structured logs reach Loki through OpenTelemetry (with trace ids).
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: nextgen-promtail
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./observability/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - nextgen_local_nw
+
+  # ── exporters ──
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: nextgen-cadvisor
+    restart: unless-stopped
+    privileged: true
+    command: ["--docker_only=true", "--housekeeping_interval=10s", "--store_container_labels=false"]
+    ports:
+      - "8086:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    networks:
+      - nextgen_local_nw
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: nextgen-node-exporter
+    restart: unless-stopped
+    pid: host
+    command: ["--path.rootfs=/host", "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"]
+    volumes:
+      - /:/host:ro
+    networks:
+      - nextgen_local_nw
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: nextgen-postgres-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://postgres_exporter:exporter_pw@postgres:5432/nextgen?sslmode=disable
+    command:
+      - --extend.query-path=/etc/postgres-exporter/queries.yaml
+    volumes:
+      - ./observability/postgres/queries.yaml:/etc/postgres-exporter/queries.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - nextgen_local_nw
+
+  pgbouncer-exporter:
+    image: prometheuscommunity/pgbouncer-exporter:v0.9.0
+    container_name: nextgen-pgbouncer-exporter
+    restart: unless-stopped
+    command:
+      - --pgBouncer.connectionString=postgres://pgbouncer_exporter:exporter_pw@pgbouncer:6432/pgbouncer?sslmode=disable
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+    networks:
+      - nextgen_local_nw
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: nextgen-redis-exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+    networks:
+      - nextgen_local_nw
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: nextgen-blackbox-exporter
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./observability/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+    networks:
+      - nextgen_local_nw
+
+  # ═══════════════════════════ TESTS (profile "tests") ═══════════════════════════
+  # Pure-python unit tests: run inside the API image, so they import the real application code.
+  unit-tests:
+    <<: *api
+    profiles: ["tests"]
+    container_name: nextgen-unit-tests
+    restart: "no"
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["-q", "-p", "no:cacheprovider", "/src/tests/unit"]
+    environment:
+      OTEL_SDK_DISABLED: "true"
+      RUN_MIGRATIONS: "false"
+    volumes:
+      - ./tests:/src/tests:ro
+    depends_on: []
+
+  # API integration tests + Selenium end-to-end tests (python + pytest + httpx + selenium)
+  integration-tests:
+    profiles: ["tests"]
+    build:
+      context: ./tests
+    image: nextgenbank-tests:local
+    container_name: nextgen-integration-tests
+    restart: "no"
+    command: ["-q", "-p", "no:cacheprovider", "/tests/integration"]
+    environment:
+      API_URL: http://api:8000/api/v1
+      MAILPIT_URL: http://mailpit:8025
+    volumes:
+      - ./tests:/tests:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - nextgen_local_nw
+
+  e2e-tests:
+    profiles: ["tests"]
+    image: nextgenbank-tests:local
+    container_name: nextgen-e2e-tests
+    restart: "no"
+    command: ["-q", "-p", "no:cacheprovider", "/tests/e2e"]
+    environment:
+      BASE_URL: http://frontend
+      MAILPIT_URL: http://mailpit:8025
+      SELENIUM_URL: http://selenium:4444/wd/hub
+    volumes:
+      - ./tests:/tests:ro
+    depends_on:
+      frontend:
+        condition: service_healthy
+      selenium:
+        condition: service_started
+    networks:
+      - nextgen_local_nw
+
+  selenium:
+    profiles: ["tests"]
+    image: selenium/standalone-chrome:latest
+    container_name: nextgen-selenium
+    shm_size: 2gb
+    ports:
+      - "4444:4444"
+      - "7900:7900"    # noVNC: watch the browser at http://localhost:7900 (password: secret)
+    networks:
+      - nextgen_local_nw
+
+  # k6 performance tests: smoke / load / spike / soak / stress / breakpoint
+  k6:
+    profiles: ["tests"]
+    image: grafana/k6:0.54.0
+    container_name: nextgen-k6
+    environment:
+      API_URL: http://api:8000/api/v1
+      MAILPIT_URL: http://mailpit:8025
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: "p(50),p(95),p(99),max"
+    volumes:
+      - ./tests/performance:/scripts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - nextgen_local_nw
+
+networks:
+  nextgen_local_nw:
+    name: nextgen_local_nw
+    driver: bridge
+
+volumes:
+  nextgen_local_db:
+  nextgen_redis_data:
+  nextgen_mailpit_data:
+  nextgen_rabbitmq_data:
+  nextgen_mlflow_data:
+  nextgen_api_logs:
+  nextgen_prometheus_data:
+  nextgen_loki_data:
+  nextgen_tempo_data:
+  nextgen_grafana_data:

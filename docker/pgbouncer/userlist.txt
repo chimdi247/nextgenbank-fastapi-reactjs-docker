@@ -1,0 +1,3 @@
+"nextgen" "nextgen_pw"
+"pgbouncer_admin" "admin_pw"
+"pgbouncer_exporter" "exporter_pw"

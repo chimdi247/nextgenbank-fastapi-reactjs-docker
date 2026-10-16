@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 42 28% 95%;
+    --foreground: 160 28% 9%;
+    --card: 42 40% 99%;
+    --card-foreground: 160 28% 9%;
+    --primary: 161 78% 22%;
+    --primary-foreground: 42 40% 98%;
+    --secondary: 42 20% 90%;
+    --secondary-foreground: 160 28% 14%;
+    --muted: 42 18% 91%;
+    --muted-foreground: 160 8% 38%;
+    --accent: 41 70% 90%;
+    --accent-foreground: 36 70% 20%;
+    --destructive: 4 66% 42%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 42 14% 83%;
+    --input: 42 14% 78%;
+    --ring: 41 62% 45%;
+    --radius: 0.6rem;
+    --ink: 163 52% 10%;
+    --brass: 41 55% 52%;
+    --success: 152 60% 28%;
+  }
+  * { @apply border-border; }
+  html, body, #root { height: 100%; }
+  body { @apply bg-background text-foreground font-sans antialiased; }
+  h1, h2, h3 { font-family: "Fraunces Variable", ui-serif, Georgia, serif; letter-spacing: -0.015em; }
+}
+
+/* engraved guilloche-style texture used on cards and the sign-in panel */
+.guilloche {
+  background-image:
+    repeating-radial-gradient(circle at 20% 120%, transparent 0 14px, hsl(var(--brass) / .13) 14px 15px),
+    repeating-radial-gradient(circle at 90% -20%, transparent 0 18px, hsl(var(--brass) / .10) 18px 19px);
+}
+.num { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}

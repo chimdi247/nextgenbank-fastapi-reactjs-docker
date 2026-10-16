@@ -1,0 +1,11 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: nextgen-email
+    receivers:
+      - uid: nextgen-email-receiver
+        type: email
+        settings:
+          addresses: ${ALERT_EMAIL_TO}
+          singleEmail: false

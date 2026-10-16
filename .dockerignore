@@ -1,0 +1,21 @@
+# keep the API image small: only the backend, migrations and alembic.ini are needed
+.git/
+.github/
+**/.git
+**/__pycache__/
+*.pyc
+*.pyo
+.vscode
+.idea
+venv/
+.venv/
+*.log
+.envs/*
+node_modules
+**/node_modules
+frontend/
+observability/
+tests/
+docker/
+*.md
+backend/app/logs/*
